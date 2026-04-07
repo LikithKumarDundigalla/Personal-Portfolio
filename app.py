@@ -182,12 +182,126 @@ with tabs[0]:
 with tabs[1]:
     st.header("Assets")
 
-    # ── Add asset — three tabs: Stock/ETF, Commodity, Indian MF ──
-    with st.expander("➕ Add New Asset", expanded=False):
+    # ── Single portfolio fetch shared across ALL sub-tabs (cached 60s) ────────
+    portfolio, total_invested_usd, total_current_usd, fx_rates = asset_mod.get_portfolio_summary()
+
+    asset_main_tabs = st.tabs(["📊 Portfolio", "➕ Add New", "✏️ Manage Holdings", "🔍 Analytics"])
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ASSETS › PORTFOLIO OVERVIEW
+    # ══════════════════════════════════════════════════════════════════════
+    with asset_main_tabs[0]:
+        col_r, _ = st.columns([1, 5])
+        with col_r:
+            if st.button("🔄 Refresh Prices", use_container_width=True):
+                with st.spinner("Fetching latest prices…"):
+                    results = asset_mod.refresh_all_prices()
+                st.success(f"Updated {len(results)} assets.")
+                asset_mod.get_portfolio_summary.clear()
+                st.rerun()
+
+        if not portfolio:
+            st.info("No assets yet. Go to **Add New** to get started.")
+        else:
+            if fx_rates:
+                rate_parts = [f"1 {cur} = ${rate:.4f}" for cur, rate in fx_rates.items() if cur != "USD"]
+                if rate_parts:
+                    st.caption("FX rates used: " + "  |  ".join(rate_parts))
+
+            # ── Portfolio metrics ──
+            port_c1, port_c2, port_c3 = st.columns(3)
+            port_c1.metric("Portfolio Value (USD)", f"${total_current_usd:,.2f}",
+                           f"{total_current_usd - total_invested_usd:+,.2f} total G/L")
+            port_c2.metric("Total Invested (USD)", f"${total_invested_usd:,.2f}")
+            _port_gl_pct = (
+                (total_current_usd - total_invested_usd) / total_invested_usd * 100
+                if total_invested_usd else 0
+            )
+            port_c3.metric("Overall Return", f"{_port_gl_pct:+.2f}%")
+
+            st.divider()
+
+            # ── Portfolio table ──
+            rows = []
+            for r in portfolio:
+                cur = r["currency"]
+                unit_label = r.get("unit", "share")
+                qty_label = (
+                    f"{r['quantity']:,.4f} {unit_label}"
+                    if unit_label != "share"
+                    else f"{r['quantity']:,.4f}"
+                )
+                rows.append({
+                    "Type":           r.get("asset_type", "stock").replace("_", " ").title(),
+                    "Symbol":         r["symbol"],
+                    "Name":           r["name"],
+                    "Qty":            qty_label,
+                    f"Avg Cost ({cur})": f"{r['avg_buy_price']:,.4f}",
+                    f"Price ({cur})": f"{r['current_price']:,.4f}" if r["current_price"] else "—",
+                    f"Value ({cur})": f"{r['current_value']:,.2f}" if r["current_value"] else "—",
+                    "Value (USD)":    f"${r['current_value_usd']:,.2f}" if r["current_value_usd"] else "—",
+                    f"G/L ({cur})":   f"{r['gain_loss']:+,.2f}" if r["gain_loss"] is not None else "—",
+                    "G/L %":          f"{r['gain_loss_pct']:+.2f}%" if r["gain_loss_pct"] is not None else "—",
+                    "As of":          r["price_date"],
+                })
+
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+            # ── Indian MF quick NAV update ──
+            _imf_assets = [r for r in portfolio if r.get("asset_type") == "mutual_fund"]
+            if _imf_assets:
+                with st.expander("🇮🇳 Quick NAV Update (Indian Mutual Funds)", expanded=False):
+                    st.caption(
+                        "Enter today's NAV for each fund. "
+                        "Find NAVs at [mfapi.in](https://www.mfapi.in) or your fund house website."
+                    )
+                    for _mf in _imf_assets:
+                        _mf_nav_now  = _mf.get("current_price") or _mf.get("avg_buy_price") or 0.0
+                        _mf_invested = (_mf.get("avg_buy_price") or 0) * _mf["quantity"]
+                        _mf_cur_val  = _mf_nav_now * _mf["quantity"]
+                        _mf_gl       = _mf_cur_val - _mf_invested
+                        _mf_gl_pct   = (_mf_gl / _mf_invested * 100) if _mf_invested else 0
+
+                        with st.form(f"mf_nav_upd_{_mf['id']}"):
+                            _nc1, _nc2, _nc3, _nc4 = st.columns([3, 1, 1, 1])
+                            _nc1.markdown(
+                                f"**{_mf['name']}**  \n"
+                                f"`{_mf['symbol']}` · {_mf['quantity']:,.3f} units · "
+                                f"Avg cost ₹{_mf.get('avg_buy_price', 0):,.4f}"
+                            )
+                            _nc2.metric("Current NAV", f"₹{_mf_nav_now:,.4f}",
+                                        help=f"As of {_mf.get('price_date', '—')}")
+                            _nc3.metric("Value", f"₹{_mf_cur_val:,.2f}",
+                                        delta=f"{_mf_gl_pct:+.2f}%",
+                                        delta_color="normal" if _mf_gl >= 0 else "inverse")
+                            _new_nav_input = _nc4.number_input(
+                                "New NAV (₹)", min_value=0.0, value=float(_mf_nav_now),
+                                step=0.01, key=f"nav_inp_{_mf['id']}",
+                            )
+                            if st.form_submit_button("💾 Save NAV", use_container_width=True):
+                                if _new_nav_input > 0:
+                                    db.upsert_price(_mf["id"], str(date.today()), _new_nav_input)
+                                    _new_val = _new_nav_input * _mf["quantity"]
+                                    _new_gl  = _new_val - _mf_invested
+                                    st.success(
+                                        f"NAV updated to ₹{_new_nav_input:,.4f}  |  "
+                                        f"New value: ₹{_new_val:,.2f}  |  "
+                                        f"G/L: {'▲' if _new_gl >= 0 else '▼'} ₹{abs(_new_gl):,.2f}"
+                                    )
+                                    asset_mod.get_portfolio_summary.clear()
+                                    st.rerun()
+                                else:
+                                    st.error("NAV must be greater than 0.")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ASSETS › ADD NEW
+    # ══════════════════════════════════════════════════════════════════════
+    with asset_main_tabs[1]:
         asset_add_tabs = st.tabs([
-            "📈 Stock / ETF / Mutual Fund",
+            "📈 Stock / ETF / Crypto",
             "🥇 Commodity (Gold, Silver…)",
             "🇮🇳 Indian Mutual Fund",
+            "🚗 Vehicle / Physical Asset",
         ])
 
         with asset_add_tabs[0]:
@@ -218,6 +332,7 @@ with tabs[1]:
                                      quantity=quantity, avg_buy_price=avg_buy_price,
                                      currency=info["currency"], asset_type=asset_type, unit="share")
                         st.success(f"Added {symbol.upper()} — {info['name']} ({info['currency']})")
+                        asset_mod.get_portfolio_summary.clear()
                         st.rerun()
 
         with asset_add_tabs[1]:
@@ -378,6 +493,7 @@ with tabs[1]:
                                 f"= {_total_g_final:.4g}g ({_oz_total:.4g} oz) of {_comm_name} "
                                 f"@ {_comm_currency_p} {_price_per_piece:,.2f}/piece"
                             )
+                            asset_mod.get_portfolio_summary.clear()
                             st.rerun()
                         else:
                             st.error("Bar weight must be greater than 0.")
@@ -422,6 +538,7 @@ with tabs[1]:
                         st.success(
                             f"Added {_quantity_d} {_unit_label}(s) of {_comm_name}"
                         )
+                        asset_mod.get_portfolio_summary.clear()
                         st.rerun()
 
         # ── Indian Mutual Fund tab ─────────────────────────────────────────────
@@ -502,297 +619,683 @@ with tabs[1]:
                             f"Added **{_imf_name}** — {_imf_units:,.3f} units "
                             f"@ ₹{_imf_buy_nav:,.4f} purchase NAV"
                         )
+                        asset_mod.get_portfolio_summary.clear()
                         st.rerun()
                     else:
                         st.error("Fund name, units, and purchase NAV are required.")
 
-    # ── Refresh prices button ──
-    col_r, _ = st.columns([1, 5])
-    with col_r:
-        if st.button("🔄 Refresh Prices Now"):
-            with st.spinner("Fetching latest prices..."):
-                results = asset_mod.refresh_all_prices()
-            st.success(f"Updated {len(results)} assets.")
-            st.rerun()
+        # ── Vehicle / Physical Asset tab ──────────────────────────────────
+        with asset_add_tabs[3]:
 
-    # ── Portfolio table ──
-    portfolio, total_invested_usd, total_current_usd, fx_rates = asset_mod.get_portfolio_summary()
+            # ── Depreciation engine ────────────────────────────────────────
+            def _estimate_value(purchase_price: float, purchase_date, category: str,
+                                mileage_km: float = 0) -> float:
+                """
+                Estimate current market value using US industry depreciation curves.
 
-    if not portfolio:
-        st.info("No assets yet. Add one above.")
-    else:
-        st.subheader("Your Portfolio")
+                Car/Truck/SUV  — based on iSeeCars / CarEdge research:
+                  Yr 1: -20%  Yr 2: -16%  Yr 3: -13%  Yr 4: -12%  Yr 5: -11%
+                  Yr 6+: -9% per year  (most cars bottom out ~15-20% of new price)
+                Motorcycle    — steeper: -25% yr1, -15%/yr after
+                Property (US) — appreciates ~4% per year (historical FHFA avg)
+                Electronics   — -40% yr1, -30% yr2, -20%/yr after (min 5%)
+                Other         — straight-line 10%/yr (min 10% retained)
 
-        if fx_rates:
-            rate_parts = [f"1 {cur} = ${rate:.4f}" for cur, rate in fx_rates.items() if cur != "USD"]
-            if rate_parts:
-                st.caption("FX rates used: " + "  |  ".join(rate_parts))
+                High-mileage penalty for vehicles (>15k miles/yr US avg):
+                  extra -1% per 5000 miles above 15k/yr threshold.
+                """
+                from datetime import date as _date
+                years = max(0.0, (_date.today() - purchase_date).days / 365.25)
 
-        rows = []
-        for r in portfolio:
-            cur = r["currency"]
-            val_usd = r["current_value_usd"]
-            unit_label = r.get("unit", "share")
-            qty_label = f"{r['quantity']:,.4f} {unit_label}" if unit_label != "share" else f"{r['quantity']:,.4f}"
+                if category in ("Car", "Truck / SUV", "Electric Vehicle"):
+                    # Year-by-year cumulative retention from new price
+                    schedule = [1.0, 0.80, 0.672, 0.584, 0.514, 0.458]
+                    if years <= 5:
+                        import math
+                        lo, hi = int(years), min(5, int(years) + 1)
+                        frac = years - lo
+                        retention = schedule[lo] + frac * (schedule[hi] - schedule[lo])
+                    else:
+                        retention = schedule[5] * (0.91 ** (years - 5))
+                    retention = max(0.12, retention)   # floor: 12% of new price
 
-            rows.append({
-                "Type":           r.get("asset_type", "stock").capitalize(),
-                "Symbol":         r["symbol"],
-                "Name":           r["name"],
-                "Qty":            qty_label,
-                f"Price ({cur})": f"{r['current_price']:,.4f}" if r["current_price"] else "—",
-                f"Value ({cur})": f"{r['current_value']:,.2f}" if r["current_value"] else "—",
-                "Value (USD)":    f"${val_usd:,.2f}" if val_usd else "—",
-                f"G/L ({cur})":   f"{r['gain_loss']:+,.2f}" if r["gain_loss"] is not None else "—",
-                "G/L %":          f"{r['gain_loss_pct']:+.2f}%" if r["gain_loss_pct"] is not None else "—",
-                "As of":          r["price_date"],
-            })
+                    # Mileage penalty (US avg = 15,000 miles/yr)
+                    if mileage_km > 0 and years > 0:
+                        avg_annual_miles = (mileage_km * 0.621371) / years
+                        excess_miles = max(0, avg_annual_miles - 15000)
+                        mileage_penalty = min(0.20, (excess_miles / 5000) * 0.01)
+                        retention = max(0.10, retention - mileage_penalty)
 
-        df = pd.DataFrame(rows)
-        st.dataframe(df, width='stretch', hide_index=True)
+                    return purchase_price * retention
 
-        # ── Portfolio totals ──
-        port_c1, port_c2, port_c3 = st.columns(3)
-        port_c1.metric("Portfolio Value (USD)", f"${total_current_usd:,.2f}",
-                       f"{total_current_usd - total_invested_usd:+,.2f} total G/L")
-        port_c2.metric("Total Invested (USD)", f"${total_invested_usd:,.2f}")
-        _port_gl_pct = (total_current_usd - total_invested_usd) / total_invested_usd * 100 if total_invested_usd else 0
-        port_c3.metric("Return", f"{_port_gl_pct:+.2f}%")
+                elif category == "Bike / Motorcycle":
+                    retention = max(0.15, 0.75 ** years)
+                    return purchase_price * retention
 
-        # ── Indian MF NAV update panel ────────────────────────────────────────
-        _imf_assets = [r for r in portfolio if r.get("asset_type") == "mutual_fund"]
-        if _imf_assets:
-            with st.expander("🇮🇳 Update Indian MF NAVs", expanded=True):
-                st.caption(
-                    "Enter today's NAV for each fund. "
-                    "Find the latest NAV at [mfapi.in](https://www.mfapi.in) or your fund house website."
+                elif category == "Property":
+                    return purchase_price * (1.04 ** years)
+
+                elif category == "Electronics":
+                    yearly = [1.0, 0.60, 0.42, 0.25, 0.10]
+                    if int(years) < len(yearly):
+                        lo, hi = int(years), min(len(yearly) - 1, int(years) + 1)
+                        frac = years - lo
+                        retention = yearly[lo] + frac * (yearly[hi] - yearly[lo])
+                    else:
+                        retention = 0.05
+                    return max(purchase_price * 0.05, purchase_price * retention)
+
+                else:  # Furniture / Other
+                    retention = max(0.10, 1.0 - 0.10 * years)
+                    return purchase_price * retention
+
+            # ── UI ────────────────────────────────────────────────────────
+            st.caption(
+                "Current value is **auto-estimated** using US industry depreciation curves "
+                "(iSeeCars / CarEdge research data).  \n"
+                "You can override with the actual KBB / Carfax / Edmunds value anytime from "
+                "**Manage Holdings → Update Price**."
+            )
+
+            _PA_CATEGORIES = [
+                "Car", "Truck / SUV", "Electric Vehicle",
+                "Bike / Motorcycle", "Property", "Electronics", "Other",
+            ]
+            _pa1_col, _pa2_col = st.columns([1, 2])
+            _pa_category = _pa1_col.selectbox("Category", _PA_CATEGORIES, key="pa_cat")
+
+            # Outside form so depreciation preview updates live
+            _paf1, _paf2, _paf3 = st.columns(3)
+            _pa_name          = _paf1.text_input("Name", placeholder="e.g. 2022 Honda Civic, iPhone 15 Pro")
+            _pa_purchase_price = _paf2.number_input("Purchase Price ($)", min_value=0.0, value=0.0, step=500.0)
+            _pa_purchase_date = _paf3.date_input("Purchase Date", value=date.today(), key="pa_purchase_date")
+
+            _paf4, _paf5, _paf6 = st.columns(3)
+            _pa_currency      = _paf4.selectbox("Currency", ["USD", "INR", "EUR", "GBP", "CAD", "AED"], key="pa_currency")
+            _pa_show_mileage  = _pa_category in ("Car", "Truck / SUV", "Electric Vehicle")
+            _pa_mileage       = _paf5.number_input(
+                "Total Mileage (km, optional)",
+                min_value=0.0, value=0.0, step=1000.0,
+                help="Odometer reading in km. Used to adjust for high-mileage penalty vs US avg of 15k miles/yr.",
+            ) if _pa_show_mileage else 0.0
+            _pa_override      = _paf6.number_input(
+                "Override Value (leave 0 to use estimate)",
+                min_value=0.0, value=0.0, step=500.0,
+                help="Enter the actual KBB / Edmunds / Carfax value if you know it.",
+            )
+
+            # Live depreciation preview
+            if _pa_purchase_price > 0:
+                _pa_est = _estimate_value(
+                    _pa_purchase_price, _pa_purchase_date, _pa_category, _pa_mileage
                 )
-                for _mf in _imf_assets:
-                    _mf_nav_now = _mf.get("current_price") or _mf.get("avg_buy_price") or 0.0
-                    _mf_invested = (_mf.get("avg_buy_price") or 0) * _mf["quantity"]
-                    _mf_cur_val  = _mf_nav_now * _mf["quantity"]
-                    _mf_gl       = _mf_cur_val - _mf_invested
-                    _mf_gl_pct   = (_mf_gl / _mf_invested * 100) if _mf_invested else 0
+                _pa_final_val  = _pa_override if _pa_override > 0 else _pa_est
+                _pa_loss       = _pa_final_val - _pa_purchase_price
+                _pa_loss_pct   = _pa_loss / _pa_purchase_price * 100
+                _pa_years_old  = (_pa_purchase_date - date.today()).days / -365.25
+                _pa_years_old  = max(0.0, _pa_years_old)
 
-                    with st.form(f"mf_nav_upd_{_mf['id']}"):
-                        _nc1, _nc2, _nc3, _nc4 = st.columns([3, 1, 1, 1])
-                        _nc1.markdown(
-                            f"**{_mf['name']}**  \n"
-                            f"`{_mf['symbol']}` · {_mf['quantity']:,.3f} units · "
-                            f"Avg cost ₹{_mf.get('avg_buy_price',0):,.4f}"
+                _pv1, _pv2, _pv3, _pv4 = st.columns(4)
+                _pv1.metric("Purchase Price", f"{_pa_currency} {_pa_purchase_price:,.0f}")
+                _pv2.metric(
+                    "Auto-Estimated Value",
+                    f"{_pa_currency} {_pa_est:,.0f}",
+                    help="Based on US industry depreciation curves",
+                )
+                _pv3.metric(
+                    "Value Being Saved",
+                    f"{_pa_currency} {_pa_final_val:,.0f}",
+                    delta=f"{'Override' if _pa_override > 0 else 'Estimate'}",
+                )
+                _pv4.metric(
+                    "Depreciation / Gain",
+                    f"{_pa_currency} {_pa_loss:+,.0f}",
+                    delta=f"{_pa_loss_pct:+.1f}%",
+                    delta_color="normal" if _pa_loss >= 0 else "inverse",
+                )
+
+                # Depreciation schedule chart
+                if _pa_category != "Property":
+                    import plotly.graph_objects as _go_pa
+                    _sched_yrs  = list(range(0, 11))
+                    _sched_vals = [
+                        _estimate_value(_pa_purchase_price, date(
+                            _pa_purchase_date.year - y,
+                            _pa_purchase_date.month,
+                            _pa_purchase_date.day,
+                        ) if _pa_purchase_date.year - y >= 1900 else _pa_purchase_date,
+                        _pa_category)
+                        for y in _sched_yrs
+                    ]
+                    _sched_fig = _go_pa.Figure()
+                    _sched_fig.add_trace(_go_pa.Scatter(
+                        x=_sched_yrs, y=_sched_vals,
+                        mode="lines+markers", line=dict(color="#4f8ef7", width=2),
+                        name="Estimated Value",
+                        hovertemplate=f"Year %{{x}}: {_pa_currency} %{{y:,.0f}}<extra></extra>",
+                    ))
+                    _sched_fig.add_vline(
+                        x=_pa_years_old, line_dash="dash", line_color="#e74c3c",
+                        annotation_text=f"Now ({_pa_years_old:.1f} yrs)",
+                    )
+                    _sched_fig.update_layout(
+                        title="Depreciation Schedule (next 10 years)",
+                        xaxis_title="Years from Purchase",
+                        yaxis_title=f"Value ({_pa_currency})",
+                        height=280,
+                        margin=dict(t=40, b=30, l=0, r=0),
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(_sched_fig, use_container_width=True)
+
+                    st.caption(
+                        "Curves based on US industry data (iSeeCars / CarEdge). "
+                        "Actual resale value varies by make, model, condition, and local market. "
+                        "For exact value check [KBB](https://www.kbb.com) · "
+                        "[Edmunds](https://www.edmunds.com/tmv.html) · "
+                        "[Carfax](https://www.carfax.com/value)."
+                    )
+
+            with st.form("add_physical_asset_form"):
+                st.markdown("#### Confirm & Add to Portfolio")
+                if st.form_submit_button("➕ Add to Portfolio", type="primary"):
+                    if not _pa_name.strip():
+                        st.error("Asset name is required.")
+                    elif _pa_purchase_price <= 0:
+                        st.error("Purchase price must be greater than 0.")
+                    else:
+                        _pa_sym = (
+                            _pa_name.strip().upper()
+                            .replace(" ", "_")
+                            .replace("/", "_")[:22]
+                            + f"_{_pa_purchase_date.year}"
                         )
-                        _nc2.metric(
-                            "Current NAV",
-                            f"₹{_mf_nav_now:,.4f}",
-                            help=f"As of {_mf.get('price_date','—')}",
+                        _pa_display    = f"{_pa_category}: {_pa_name.strip()}"
+                        _pa_est_save   = _estimate_value(
+                            _pa_purchase_price, _pa_purchase_date, _pa_category, _pa_mileage
                         )
-                        _nc3.metric(
-                            "Value",
-                            f"₹{_mf_cur_val:,.2f}",
-                            delta=f"{_mf_gl_pct:+.2f}%",
-                            delta_color="normal" if _mf_gl >= 0 else "inverse",
+                        _pa_val_to_save = _pa_override if _pa_override > 0 else _pa_est_save
+                        _pa_id = db.add_asset(
+                            symbol=_pa_sym,
+                            name=_pa_display,
+                            exchange="PHYSICAL",
+                            quantity=1.0,
+                            avg_buy_price=_pa_purchase_price,
+                            currency=_pa_currency,
+                            asset_type="physical_asset",
+                            unit="unit",
                         )
-                        _new_nav_input = _nc4.number_input(
-                            "New NAV (₹)",
+                        db.upsert_price(_pa_id, str(date.today()), _pa_val_to_save)
+                        _pa_gl = _pa_val_to_save - _pa_purchase_price
+                        st.success(
+                            f"**{_pa_display}** added to portfolio.  \n"
+                            f"Paid: {_pa_currency} {_pa_purchase_price:,.0f}  →  "
+                            f"Current estimate: {_pa_currency} {_pa_val_to_save:,.0f}  "
+                            f"({_pa_gl:+,.0f} / {_pa_gl/_pa_purchase_price*100:+.1f}%)"
+                        )
+                        asset_mod.get_portfolio_summary.clear()
+                        st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ASSETS › MANAGE HOLDINGS
+    # ══════════════════════════════════════════════════════════════════════
+    with asset_main_tabs[2]:
+        _mgmt_portfolio = portfolio  # reuse cached result — no extra DB/network call
+
+        if not _mgmt_portfolio:
+            st.info("No assets yet. Go to **Add New** to get started.")
+        else:
+            # ── Asset picker ──────────────────────────────────────────────
+            _mgmt_map = {
+                f"{r['symbol']}  ·  {r['name']}  ({r.get('asset_type','stock').replace('_',' ').title()})": r
+                for r in _mgmt_portfolio
+            }
+            _mgmt_label = st.selectbox(
+                "Select holding to manage",
+                list(_mgmt_map.keys()),
+                key="mgmt_asset_sel",
+            )
+            _mgmt_r = _mgmt_map[_mgmt_label]
+            _mgmt_id   = _mgmt_r["id"]
+            _mgmt_cur  = _mgmt_r["currency"]
+            _mgmt_type = _mgmt_r.get("asset_type", "stock")
+            _mgmt_unit = _mgmt_r.get("unit", "share")
+            _mgmt_qty  = _mgmt_r["quantity"]
+            _mgmt_avg  = _mgmt_r["avg_buy_price"]
+            _mgmt_val  = _mgmt_r["current_value"]
+            _mgmt_gl   = _mgmt_r["gain_loss"]
+            _mgmt_glp  = _mgmt_r["gain_loss_pct"]
+
+            # ── Current holding snapshot ──────────────────────────────────
+            st.divider()
+            _snap1, _snap2, _snap3, _snap4 = st.columns(4)
+            _snap1.metric(
+                f"Quantity ({_mgmt_unit}s)",
+                f"{_mgmt_qty:,.4f}",
+            )
+            _snap2.metric(
+                f"Avg Cost ({_mgmt_cur})",
+                f"{_mgmt_avg:,.4f}",
+            )
+            _snap3.metric(
+                f"Current Value ({_mgmt_cur})",
+                f"{_mgmt_val:,.2f}" if _mgmt_val else "—",
+                delta=f"{_mgmt_glp:+.2f}%" if _mgmt_glp is not None else None,
+            )
+            _snap4.metric(
+                f"G/L ({_mgmt_cur})",
+                f"{_mgmt_gl:+,.2f}" if _mgmt_gl is not None else "—",
+            )
+            st.divider()
+
+            # ── Action tabs ───────────────────────────────────────────────
+            _action_tabs = st.tabs([
+                "📈 Buy More",
+                "📉 Record Sale",
+                "✏️ Edit Details",
+                "💾 Update Price",
+                "🗑️ Delete",
+            ])
+
+            # ── BUY MORE ──────────────────────────────────────────────────
+            with _action_tabs[0]:
+                st.markdown(
+                    "Add to your existing position. "
+                    "The **weighted average cost** will be recalculated automatically."
+                )
+                with st.form("form_buy_more"):
+                    _bm1, _bm2 = st.columns(2)
+                    with _bm1:
+                        _bm_qty = st.number_input(
+                            f"Additional {_mgmt_unit}s purchased",
+                            min_value=0.0001,
+                            value=1.0,
+                            step=0.001 if _mgmt_type == "mutual_fund" else 0.01,
+                            format="%.4f",
+                            help="How many new shares / units / grams you bought in this transaction.",
+                        )
+                    with _bm2:
+                        _bm_price = st.number_input(
+                            f"Price paid per {_mgmt_unit} ({_mgmt_cur})",
                             min_value=0.0,
-                            value=float(_mf_nav_now),
+                            value=float(_mgmt_avg),
                             step=0.01,
-                            label_visibility="visible",
-                            key=f"nav_inp_{_mf['id']}",
+                            format="%.4f",
+                            help="The price you paid per unit in this purchase.",
                         )
-                        if st.form_submit_button("💾 Save NAV", width='stretch'):
-                            if _new_nav_input > 0:
-                                db.upsert_price(_mf["id"], str(date.today()), _new_nav_input)
-                                _new_val = _new_nav_input * _mf["quantity"]
-                                _new_gl  = _new_val - _mf_invested
-                                st.success(
-                                    f"NAV updated to ₹{_new_nav_input:,.4f}  |  "
-                                    f"New value: ₹{_new_val:,.2f}  |  "
-                                    f"G/L: {'▲' if _new_gl >= 0 else '▼'} ₹{abs(_new_gl):,.2f}"
-                                )
-                                st.rerun()
-                            else:
-                                st.error("NAV must be greater than 0.")
 
-        # ── Analyst Insights & Valuation (on-demand, per asset) ──────────────
-        with st.expander("🔍 Analyst Insights & Valuation"):
+                    # Live preview
+                    _bm_new_qty = _mgmt_qty + _bm_qty
+                    _bm_new_avg = (
+                        (_mgmt_qty * _mgmt_avg + _bm_qty * _bm_price) / _bm_new_qty
+                        if _bm_new_qty > 0 else _mgmt_avg
+                    )
+                    _bm_cost    = _bm_qty * _bm_price
+                    _bm_new_val = _bm_new_qty * (_mgmt_r.get("current_price") or _mgmt_avg)
+
+                    st.info(
+                        f"**This purchase:** {_bm_qty:,.4f} {_mgmt_unit}(s) "
+                        f"@ {_mgmt_cur} {_bm_price:,.4f} = **{_mgmt_cur} {_bm_cost:,.2f}**  \n"
+                        f"**New total:** {_bm_new_qty:,.4f} {_mgmt_unit}(s)  |  "
+                        f"New avg cost: **{_mgmt_cur} {_bm_new_avg:,.4f}**  |  "
+                        f"Est. value: **{_mgmt_cur} {_bm_new_val:,.2f}**"
+                    )
+
+                    if st.form_submit_button("✅ Confirm Purchase", type="primary"):
+                        db.update_asset_quantity(_mgmt_id, _bm_new_qty, _bm_new_avg)
+                        # Record today's price if not already present
+                        if _mgmt_r.get("current_price"):
+                            db.upsert_price(_mgmt_id, str(date.today()), _mgmt_r["current_price"])
+                        st.success(
+                            f"Position updated!  \n"
+                            f"**{_mgmt_r['symbol']}**: {_mgmt_qty:,.4f} → **{_bm_new_qty:,.4f}** {_mgmt_unit}(s)  |  "
+                            f"Avg cost: {_mgmt_cur} {_mgmt_avg:,.4f} → **{_mgmt_cur} {_bm_new_avg:,.4f}**"
+                        )
+                        asset_mod.get_portfolio_summary.clear()
+                        st.rerun()
+
+            # ── RECORD SALE ───────────────────────────────────────────────
+            with _action_tabs[1]:
+                st.markdown(
+                    "Record a full or partial sale. "
+                    "The average cost is **not** changed; only the quantity is reduced."
+                )
+                with st.form("form_sell"):
+                    _sl1, _sl2 = st.columns(2)
+                    with _sl1:
+                        _sl_qty = st.number_input(
+                            f"{_mgmt_unit.capitalize()}s sold",
+                            min_value=0.0001,
+                            max_value=float(_mgmt_qty),
+                            value=min(1.0, float(_mgmt_qty)),
+                            step=0.001 if _mgmt_type == "mutual_fund" else 0.01,
+                            format="%.4f",
+                            help=f"Max: {_mgmt_qty:,.4f} {_mgmt_unit}(s)",
+                        )
+                    with _sl2:
+                        _sl_price = st.number_input(
+                            f"Sale price per {_mgmt_unit} ({_mgmt_cur})",
+                            min_value=0.0,
+                            value=float(_mgmt_r.get("current_price") or _mgmt_avg),
+                            step=0.01,
+                            format="%.4f",
+                        )
+
+                    _sl_new_qty   = _mgmt_qty - _sl_qty
+                    _sl_proceeds  = _sl_qty * _sl_price
+                    _sl_cost      = _sl_qty * _mgmt_avg
+                    _sl_realised  = _sl_proceeds - _sl_cost
+                    _sl_realised_pct = (_sl_realised / _sl_cost * 100) if _sl_cost > 0 else 0
+
+                    st.info(
+                        f"**Proceeds:** {_mgmt_cur} {_sl_proceeds:,.2f}  |  "
+                        f"Cost basis: {_mgmt_cur} {_sl_cost:,.2f}  |  "
+                        f"Realised G/L: **{_mgmt_cur} {_sl_realised:+,.2f}** "
+                        f"({_sl_realised_pct:+.2f}%)  \n"
+                        f"**Remaining:** {_sl_new_qty:,.4f} {_mgmt_unit}(s)"
+                    )
+
+                    if st.form_submit_button("✅ Confirm Sale", type="primary"):
+                        if _sl_new_qty < 0:
+                            st.error("Cannot sell more than you own.")
+                        elif _sl_new_qty == 0:
+                            db.delete_asset(_mgmt_id)
+                            st.success(
+                                f"Full position sold. **{_mgmt_r['symbol']}** removed from portfolio.  \n"
+                                f"Realised G/L: {_mgmt_cur} {_sl_realised:+,.2f}"
+                            )
+                            asset_mod.get_portfolio_summary.clear()
+                            st.rerun()
+                        else:
+                            db.update_asset_quantity(_mgmt_id, _sl_new_qty, _mgmt_avg)
+                            st.success(
+                                f"Sale recorded!  \n"
+                                f"**{_mgmt_r['symbol']}**: {_mgmt_qty:,.4f} → **{_sl_new_qty:,.4f}** {_mgmt_unit}(s)  \n"
+                                f"Realised G/L: **{_mgmt_cur} {_sl_realised:+,.2f}** ({_sl_realised_pct:+.2f}%)"
+                            )
+                            asset_mod.get_portfolio_summary.clear()
+                            st.rerun()
+
+            # ── EDIT DETAILS ──────────────────────────────────────────────
+            with _action_tabs[2]:
+                st.markdown(
+                    "Correct the symbol, name, exchange, average cost, "
+                    "quantity, or currency for this holding."
+                )
+                _EXCHANGES = [
+                    "NSE", "BSE", "NASDAQ", "NYSE",
+                    "MUTUAL_FUND", "MUTUAL_FUND_IN", "CRYPTO", "COMMODITY", "OTHER",
+                ]
+                _cur_exch = _mgmt_r.get("exchange", "OTHER")
+                _exch_idx = _EXCHANGES.index(_cur_exch) if _cur_exch in _EXCHANGES else len(_EXCHANGES) - 1
+                _CURRENCIES = ["INR", "USD", "EUR", "GBP", "CAD", "AED", "SGD", "AUD"]
+                _cur_cur_idx = _CURRENCIES.index(_mgmt_cur) if _mgmt_cur in _CURRENCIES else 1
+
+                with st.form("form_edit_details"):
+                    _ed1, _ed2 = st.columns(2)
+                    with _ed1:
+                        _ed_sym  = st.text_input("Symbol", value=_mgmt_r["symbol"])
+                        _ed_name = st.text_input("Name / Description", value=_mgmt_r["name"])
+                        _ed_exch = st.selectbox("Exchange / Type", _EXCHANGES, index=_exch_idx)
+                    with _ed2:
+                        _ed_qty  = st.number_input(
+                            f"Quantity ({_mgmt_unit}s)",
+                            min_value=0.0001,
+                            value=float(_mgmt_qty),
+                            step=0.001 if _mgmt_type == "mutual_fund" else 0.01,
+                            format="%.4f",
+                        )
+                        _ed_avg  = st.number_input(
+                            f"Avg Buy Price ({_mgmt_cur})",
+                            min_value=0.0,
+                            value=float(_mgmt_avg),
+                            step=0.01,
+                            format="%.4f",
+                        )
+                        _ed_cur  = st.selectbox("Currency", _CURRENCIES, index=_cur_cur_idx)
+
+                    if st.form_submit_button("💾 Save Changes", type="primary"):
+                        if not _ed_sym.strip():
+                            st.error("Symbol cannot be empty.")
+                        else:
+                            db.update_asset_full(
+                                _mgmt_id,
+                                symbol=_ed_sym.strip(),
+                                name=_ed_name.strip(),
+                                exchange=_ed_exch,
+                                quantity=_ed_qty,
+                                avg_buy_price=_ed_avg,
+                                currency=_ed_cur,
+                            )
+                            st.success(
+                                f"**{_mgmt_r['symbol']}** updated successfully.  \n"
+                                f"Symbol: {_mgmt_r['symbol']} → **{_ed_sym.upper()}**  |  "
+                                f"Qty: {_mgmt_qty:,.4f} → **{_ed_qty:,.4f}**  |  "
+                                f"Avg cost: {_mgmt_cur} {_mgmt_avg:,.4f} → **{_ed_cur} {_ed_avg:,.4f}**"
+                            )
+                            asset_mod.get_portfolio_summary.clear()
+                            st.rerun()
+
+            # ── UPDATE PRICE ──────────────────────────────────────────────
+            with _action_tabs[3]:
+                _is_auto = _mgmt_type not in ("mutual_fund",) and _mgmt_r.get("exchange") not in ("MUTUAL_FUND_IN",)
+                if _is_auto:
+                    st.info(
+                        f"**{_mgmt_r['symbol']}** prices are fetched automatically from Yahoo Finance.  \n"
+                        "You can still override the price manually if needed (e.g. market is closed)."
+                    )
+                else:
+                    st.markdown(
+                        "Enter today's NAV / price. "
+                        "This is the value used for portfolio calculations."
+                    )
+
+                _up_cur_price = _mgmt_r.get("current_price") or _mgmt_avg
+                with st.form("form_update_price"):
+                    _up1, _up2 = st.columns(2)
+                    with _up1:
+                        _up_price = st.number_input(
+                            f"New Price / NAV ({_mgmt_cur})",
+                            min_value=0.0,
+                            value=float(_up_cur_price),
+                            step=0.01,
+                            format="%.4f",
+                        )
+                    with _up2:
+                        _up_date = st.date_input(
+                            "As of date",
+                            value=date.today(),
+                            key="mgmt_price_date",
+                        )
+
+                    if _up_price > 0 and _mgmt_qty > 0:
+                        _up_new_val = _up_price * _mgmt_qty
+                        _up_gl      = _up_new_val - _mgmt_qty * _mgmt_avg
+                        st.info(
+                            f"New value: **{_mgmt_cur} {_up_new_val:,.2f}**  |  "
+                            f"G/L: **{_mgmt_cur} {_up_gl:+,.2f}**"
+                        )
+
+                    if st.form_submit_button("💾 Save Price", type="primary"):
+                        if _up_price <= 0:
+                            st.error("Price must be greater than 0.")
+                        else:
+                            db.upsert_price(_mgmt_id, str(_up_date), _up_price)
+                            st.success(
+                                f"Price saved: {_mgmt_cur} {_up_price:,.4f} "
+                                f"for **{_mgmt_r['symbol']}** on {_up_date}"
+                            )
+                            asset_mod.get_portfolio_summary.clear()
+                            st.rerun()
+
+            # ── DELETE ────────────────────────────────────────────────────
+            with _action_tabs[4]:
+                st.warning(
+                    f"You are about to **permanently delete** "
+                    f"**{_mgmt_r['symbol']} — {_mgmt_r['name']}** "
+                    f"({_mgmt_qty:,.4f} {_mgmt_unit}s) from your portfolio.  \n"
+                    "All price history for this holding will also be deleted. "
+                    "**This cannot be undone.**"
+                )
+                _del_confirm = st.checkbox(
+                    f"Yes, I want to delete {_mgmt_r['symbol']} permanently",
+                    key="mgmt_del_confirm",
+                )
+                if st.button(
+                    f"🗑️ Delete {_mgmt_r['symbol']}",
+                    type="primary",
+                    disabled=not _del_confirm,
+                ):
+                    db.delete_asset(_mgmt_id)
+                    st.success(f"**{_mgmt_r['symbol']}** has been removed from your portfolio.")
+                    asset_mod.get_portfolio_summary.clear()
+                    st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ASSETS › ANALYTICS
+    # ══════════════════════════════════════════════════════════════════════
+    with asset_main_tabs[3]:
+        _an_portfolio = portfolio  # reuse cached result — no extra DB/network call
+
+        if not _an_portfolio:
+            st.info("No assets yet. Go to **Add New** to get started.")
+        else:
+            # ── Price History ─────────────────────────────────────────────
+            st.subheader("Price History")
+            _an_options = {
+                f"{r['symbol']} ({r['currency']}) — {r['name']}": r["id"]
+                for r in _an_portfolio
+            }
+            _an_sel = st.selectbox("Select asset", list(_an_options.keys()), key="an_hist_sel")
+            if _an_sel:
+                _an_id = _an_options[_an_sel]
+                _an_cur = next(r["currency"] for r in _an_portfolio if r["id"] == _an_id)
+                _an_history = db.get_price_history(_an_id, days=365)
+                if len(_an_history) > 1:
+                    _hist_df = pd.DataFrame(_an_history)
+                    _hist_fig = px.line(
+                        _hist_df, x="date", y="price",
+                        title=_an_sel,
+                        labels={"price": f"Price ({_an_cur})", "date": "Date"},
+                    )
+                    _hist_fig.update_traces(line_color="#4f8ef7", line_width=2)
+                    _hist_fig.update_layout(hovermode="x unified")
+                    st.plotly_chart(_hist_fig, use_container_width=True)
+                else:
+                    st.info("Not enough history yet — prices are recorded daily. Check back tomorrow.")
+
+            st.divider()
+
+            # ── Analyst Insights ──────────────────────────────────────────
+            st.subheader("Analyst Insights & Valuation")
             st.caption(
                 "Fetches live analyst price targets, consensus recommendation, "
-                "52-week range and valuation multiples from Yahoo Finance. "
-                "Available for most US/Indian listed stocks and ETFs; "
+                "52-week range, and valuation multiples from Yahoo Finance. "
+                "Available for US/Indian listed stocks and ETFs; "
                 "not available for commodities, crypto, or unlisted assets."
             )
-            _stock_assets = [r for r in portfolio if r.get("asset_type") not in ("commodity",)]
-            if not _stock_assets:
+            _an_stocks = [r for r in _an_portfolio if r.get("asset_type") not in ("commodity",)]
+            if not _an_stocks:
                 st.info("No stocks/ETFs in your portfolio.")
             else:
-                _insight_sym = st.selectbox(
-                    "Select asset",
-                    [f"{r['symbol']} — {r['name']}" for r in _stock_assets],
-                    key="insight_sym",
+                _an_insight_label = st.selectbox(
+                    "Select asset for analyst data",
+                    [f"{r['symbol']} — {r['name']}" for r in _an_stocks],
+                    key="an_insight_sym",
                 )
-                if st.button("📡 Fetch Analyst Data", key="fetch_analyst"):
-                    _sel_sym = _insight_sym.split(" — ")[0]
-                    _sel_r = next(r for r in _stock_assets if r["symbol"] == _sel_sym)
-                    with st.spinner(f"Fetching analyst data for {_sel_sym}…"):
-                        _ad = asset_mod.fetch_analyst_data(_sel_sym)
-                    st.session_state["_analyst_data"] = _ad
-                    st.session_state["_analyst_sym"] = _sel_sym
-                    st.session_state["_analyst_r"] = _sel_r
+                if st.button("📡 Fetch Analyst Data", key="an_fetch_analyst"):
+                    _an_sym = _an_insight_label.split(" — ")[0]
+                    _an_r   = next(r for r in _an_stocks if r["symbol"] == _an_sym)
+                    with st.spinner(f"Fetching analyst data for {_an_sym}…"):
+                        _an_ad = asset_mod.fetch_analyst_data(_an_sym)
+                    st.session_state["_an_analyst_data"] = _an_ad
+                    st.session_state["_an_analyst_sym"]  = _an_sym
+                    st.session_state["_an_analyst_r"]    = _an_r
 
-                if st.session_state.get("_analyst_sym"):
-                    _ad  = st.session_state["_analyst_data"]
-                    _sym = st.session_state["_analyst_sym"]
-                    _ar  = st.session_state["_analyst_r"]
-                    _cur = _ar["currency"]
+                if st.session_state.get("_an_analyst_sym"):
+                    _an_ad  = st.session_state["_an_analyst_data"]
+                    _an_sym = st.session_state["_an_analyst_sym"]
+                    _an_ar  = st.session_state["_an_analyst_r"]
+                    _an_c   = _an_ar["currency"]
 
-                    if not _ad:
-                        st.warning(f"No analyst data available for **{_sym}** (commodity, crypto, or unlisted).")
+                    if not _an_ad:
+                        st.warning(
+                            f"No analyst data available for **{_an_sym}** "
+                            "(commodity, crypto, or unlisted asset)."
+                        )
                     else:
-                        st.markdown(f"#### {_sym} — {_ar['name']}")
-                        _ia1, _ia2, _ia3, _ia4 = st.columns(4)
+                        st.markdown(f"#### {_an_sym} — {_an_ar['name']}")
+                        _aia1, _aia2, _aia3, _aia4 = st.columns(4)
 
-                        # Recommendation badge
-                        _rec = (_ad.get("recommendation") or "").lower().replace("_", " ")
-                        _rec_color = {
+                        _an_rec = (_an_ad.get("recommendation") or "").lower().replace("_", " ")
+                        _an_rec_color = {
                             "strong buy": "🟢", "buy": "🟢",
                             "hold": "🟡",
                             "sell": "🔴", "strong sell": "🔴",
-                        }.get(_rec, "⚪")
-                        _ia1.metric(
+                        }.get(_an_rec, "⚪")
+                        _aia1.metric(
                             "Analyst Consensus",
-                            f"{_rec_color} {_rec.title() if _rec else 'N/A'}",
-                            help=f"Based on {_ad.get('num_analysts') or 'N/A'} analyst opinions",
+                            f"{_an_rec_color} {_an_rec.title() if _an_rec else 'N/A'}",
+                            help=f"Based on {_an_ad.get('num_analysts') or 'N/A'} analyst opinions",
                         )
-
-                        # Price target
-                        _tgt = _ad.get("target_mean")
-                        _ia2.metric(
-                            f"Price Target ({_cur})",
-                            f"{_tgt:,.2f}" if _tgt else "N/A",
-                            delta=f"{_ad['upside_pct']:+.1f}% upside" if _ad.get("upside_pct") is not None else None,
-                            delta_color="normal" if (_ad.get("upside_pct") or 0) >= 0 else "inverse",
+                        _an_tgt = _an_ad.get("target_mean")
+                        _aia2.metric(
+                            f"Price Target ({_an_c})",
+                            f"{_an_tgt:,.2f}" if _an_tgt else "N/A",
+                            delta=f"{_an_ad['upside_pct']:+.1f}% upside"
+                            if _an_ad.get("upside_pct") is not None else None,
+                            delta_color="normal" if (_an_ad.get("upside_pct") or 0) >= 0 else "inverse",
                         )
+                        _an_w_hi = _an_ad.get("week52_high")
+                        _an_w_lo = _an_ad.get("week52_low")
+                        _aia3.metric("52W High", f"{_an_c} {_an_w_hi:,.2f}" if _an_w_hi else "N/A")
+                        _aia4.metric("52W Low",  f"{_an_c} {_an_w_lo:,.2f}" if _an_w_lo else "N/A")
 
-                        # 52W range
-                        _w_hi = _ad.get("week52_high")
-                        _w_lo = _ad.get("week52_low")
-                        _ia3.metric(
-                            "52W High",
-                            f"{_cur} {_w_hi:,.2f}" if _w_hi else "N/A",
-                        )
-                        _ia4.metric(
-                            "52W Low",
-                            f"{_cur} {_w_lo:,.2f}" if _w_lo else "N/A",
-                        )
+                        _an_vm = st.columns(4)
+                        _an_vm[0].metric("Trailing P/E", f"{_an_ad['trailing_pe']:.1f}×" if _an_ad.get("trailing_pe") else "N/A")
+                        _an_vm[1].metric("Forward P/E",  f"{_an_ad['forward_pe']:.1f}×"  if _an_ad.get("forward_pe")  else "N/A")
+                        _an_vm[2].metric("Price/Book",   f"{_an_ad['price_to_book']:.2f}×" if _an_ad.get("price_to_book") else "N/A")
 
-                        # Valuation multiples
-                        _vm_cols = st.columns(4)
-                        _tpe = _ad.get("trailing_pe")
-                        _fpe = _ad.get("forward_pe")
-                        _pb  = _ad.get("price_to_book")
-                        _vm_cols[0].metric("Trailing P/E", f"{_tpe:.1f}×" if _tpe else "N/A")
-                        _vm_cols[1].metric("Forward P/E",  f"{_fpe:.1f}×" if _fpe else "N/A")
-                        _vm_cols[2].metric("Price/Book",   f"{_pb:.2f}×"  if _pb  else "N/A")
-
-                        # 52W range bar
-                        if _w_lo and _w_hi and _ar.get("current_price") and _w_hi > _w_lo:
-                            _cp = _ar["current_price"]
-                            _pos = min(1.0, max(0.0, (_cp - _w_lo) / (_w_hi - _w_lo)))
+                        if _an_w_lo and _an_w_hi and _an_ar.get("current_price") and _an_w_hi > _an_w_lo:
+                            _an_cp  = _an_ar["current_price"]
+                            _an_pos = min(1.0, max(0.0, (_an_cp - _an_w_lo) / (_an_w_hi - _an_w_lo)))
                             st.markdown(
-                                f"**52W position** — {_cur} {_w_lo:,.2f} "
-                                f"◀ current: {_cp:,.2f} ({_pos*100:.0f}% of range) ▶ "
-                                f"{_cur} {_w_hi:,.2f}"
+                                f"**52W position** — {_an_c} {_an_w_lo:,.2f} "
+                                f"◀ current: {_an_cp:,.2f} ({_an_pos*100:.0f}% of range) ▶ "
+                                f"{_an_c} {_an_w_hi:,.2f}"
                             )
-                            st.progress(_pos)
+                            st.progress(_an_pos)
 
-                        # Target range bar
-                        _t_lo = _ad.get("target_low")
-                        _t_hi = _ad.get("target_high")
-                        if _t_lo and _t_hi and _tgt and _ar.get("current_price"):
-                            _cp = _ar["current_price"]
+                        _an_t_lo = _an_ad.get("target_low")
+                        _an_t_hi = _an_ad.get("target_high")
+                        if _an_t_lo and _an_t_hi and _an_tgt and _an_ar.get("current_price"):
                             st.markdown(
                                 f"**Analyst target range** — "
-                                f"Low {_cur} {_t_lo:,.2f} | "
-                                f"Mean {_cur} {_tgt:,.2f} | "
-                                f"High {_cur} {_t_hi:,.2f} "
-                                f"(current: {_cur} {_cp:,.2f})"
+                                f"Low {_an_c} {_an_t_lo:,.2f} | "
+                                f"Mean {_an_c} {_an_tgt:,.2f} | "
+                                f"High {_an_c} {_an_t_hi:,.2f} "
+                                f"(current: {_an_c} {_an_ar['current_price']:,.2f})"
                             )
 
-        # ── Dividend income ──
-        with st.expander("💵 Annual Dividend Income (last 12 months)"):
-            with st.spinner("Fetching dividend data..."):
+            st.divider()
+
+            # ── Annual Dividend Income ─────────────────────────────────────
+            st.subheader("Annual Dividend Income (last 12 months)")
+            with st.spinner("Fetching dividend data…"):
                 div_rows, total_div_usd = asset_mod.get_annual_dividend_income()
             if not div_rows:
                 st.info("No dividend income found for your holdings in the last 12 months.")
             else:
-                div_df = pd.DataFrame([{
-                    "Symbol": d["symbol"],
-                    "Name": d["name"],
-                    "Qty": d["quantity"],
-                    f"Annual Div ({d['currency']})": f"{d['dividend_native']:,.2f}",
-                    "Annual Div (USD)": f"${d['dividend_usd']:,.2f}",
-                } for d in div_rows])
-                st.dataframe(div_df, width='stretch', hide_index=True)
                 st.metric("Total Annual Dividends (USD)", f"${total_div_usd:,.2f}",
-                          help="Sum of dividends paid by all your holdings in the last 12 months")
-
-        # ── Price history chart ──
-        st.subheader("Price History")
-        asset_options = {f"{r['symbol']} ({r['currency']}) — {r['name']}": r["id"] for r in portfolio}
-        selected = st.selectbox("Select asset", list(asset_options.keys()))
-        if selected:
-            asset_id = asset_options[selected]
-            sel_cur = next(r["currency"] for r in portfolio if r["id"] == asset_id)
-            history = db.get_price_history(asset_id, days=180)
-            if len(history) > 1:
-                hist_df = pd.DataFrame(history)
-                fig = px.line(hist_df, x="date", y="price", title=selected)
-                fig.update_layout(xaxis_title="Date", yaxis_title=f"Price ({sel_cur})")
-                st.plotly_chart(fig, width='stretch')
-            else:
-                st.info("Not enough history yet — prices are recorded daily, check back tomorrow.")
-
-        # ── Manual price update (for Indian MFs and assets not on Yahoo Finance) ──
-        with st.expander("✏️ Update Price Manually (Indian MFs, unlisted assets)"):
-            st.caption(
-                "Use this for assets whose price **cannot be fetched automatically** — "
-                "e.g. direct Indian Mutual Funds (not on Yahoo Finance), unlisted equity, PPF, NPS, FDs, SGBs, etc."
-            )
-            upd_options = {
-                f"{r['symbol']} — {r['name']} ({r['currency']})": r["id"]
-                for r in portfolio
-            }
-            upd_selected = st.selectbox("Select asset to update", list(upd_options.keys()), key="manual_price_asset")
-            if upd_selected:
-                _upd_id = upd_options[upd_selected]
-                _upd_r = next(r for r in portfolio if r["id"] == _upd_id)
-                _cur_price = _upd_r.get("current_price")
-                with st.form("manual_price_form"):
-                    _new_price = st.number_input(
-                        f"New Price ({_upd_r['currency']})",
-                        min_value=0.0,
-                        value=float(_cur_price) if _cur_price else 0.0,
-                        step=0.01,
-                        help="Enter the latest NAV or market price in the asset's native currency.",
-                    )
-                    _price_date = st.date_input("As of date", value=date.today(), key="manual_price_date")
-                    if st.form_submit_button("💾 Save Price", type="primary"):
-                        db.upsert_price(_upd_id, str(_price_date), _new_price)
-                        st.success(
-                            f"Price updated: {_upd_r['currency']} {_new_price:,.4f} "
-                            f"for {_upd_r['symbol']} on {_price_date}"
-                        )
-                        st.rerun()
-
-        # ── Delete asset ──
-        with st.expander("🗑️ Remove an Asset"):
-            del_options = {f"{r['symbol']} ({r.get('asset_type','stock')}) — {r['name']}": r["id"] for r in portfolio}
-            del_selected = st.selectbox("Select to remove", list(del_options.keys()), key="del_asset")
-            if st.button("Remove Asset", type="secondary"):
-                db.delete_asset(del_options[del_selected])
-                st.success("Asset removed.")
-                st.rerun()
+                          help="Sum of dividends paid by all holdings in the last 12 months")
+                div_df = pd.DataFrame([{
+                    "Symbol":                           d["symbol"],
+                    "Name":                             d["name"],
+                    "Qty":                              d["quantity"],
+                    f"Annual Div ({d['currency']})":    f"{d['dividend_native']:,.2f}",
+                    "Annual Div (USD)":                 f"${d['dividend_usd']:,.2f}",
+                } for d in div_rows])
+                st.dataframe(div_df, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

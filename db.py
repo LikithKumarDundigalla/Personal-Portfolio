@@ -1,10 +1,20 @@
 import sqlite3
 from config import DB_PATH
 
+# ── Performance pragmas applied to every new connection ───────────────────────
+_PRAGMAS = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA cache_size=-16000;
+PRAGMA temp_store=MEMORY;
+PRAGMA mmap_size=134217728;
+"""
+
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.executescript(_PRAGMAS)
     return conn
 
 
@@ -141,6 +151,25 @@ def update_asset_quantity(asset_id: int, quantity: float, avg_buy_price: float):
     conn.close()
 
 
+def update_asset_full(asset_id: int, symbol: str, name: str, exchange: str,
+                      quantity: float, avg_buy_price: float, currency: str):
+    """Update all editable fields of an asset."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE assets SET symbol=?, name=?, exchange=?, quantity=?, avg_buy_price=?, currency=? WHERE id=?",
+        (symbol.upper(), name, exchange, quantity, avg_buy_price, currency, asset_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_asset(asset_id: int):
+    conn = get_conn()
+    row = conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def delete_asset(asset_id: int):
     conn = get_conn()
     conn.execute("DELETE FROM assets WHERE id=?", (asset_id,))
@@ -167,6 +196,32 @@ def get_latest_price(asset_id: int):
     ).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def get_latest_prices_batch(asset_ids: list[int]) -> dict[int, dict]:
+    """
+    Return {asset_id: {price, date}} for ALL given IDs in a single query.
+    Much faster than calling get_latest_price() N times.
+    """
+    if not asset_ids:
+        return {}
+    conn = get_conn()
+    placeholders = ",".join("?" * len(asset_ids))
+    rows = conn.execute(
+        f"""
+        SELECT ap.asset_id, ap.price, ap.date
+        FROM asset_prices ap
+        INNER JOIN (
+            SELECT asset_id, MAX(date) AS max_date
+            FROM asset_prices
+            WHERE asset_id IN ({placeholders})
+            GROUP BY asset_id
+        ) latest ON ap.asset_id = latest.asset_id AND ap.date = latest.max_date
+        """,
+        asset_ids,
+    ).fetchall()
+    conn.close()
+    return {row["asset_id"]: {"price": row["price"], "date": row["date"]} for row in rows}
 
 
 def get_price_history(asset_id: int, days: int = 90):

@@ -8,6 +8,7 @@ Crypto     : BTC-USD, ETH-USD ...
 
 from datetime import date
 import yfinance as yf
+import streamlit as st
 import db
 
 # In-memory FX cache so we don't hammer Yahoo Finance on every rerun
@@ -71,12 +72,11 @@ PHYSICAL_METAL_DENOMINATIONS: dict[str, list[tuple[str, float | None]]] = {
 }
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_fx_rate_to_usd(currency: str) -> float:
     """
     Return real-time rate: how many USD = 1 unit of `currency`.
-    e.g. INR -> ~0.012,  EUR -> ~1.08,  USD -> 1.0
-    Uses Yahoo Finance forex tickers ({CURRENCY}USD=X).
-    Falls back to last cached value, then 1.0 if completely unavailable.
+    Cached for 30 minutes — eliminates repeated ~700ms Yahoo Finance calls.
     """
     currency = currency.upper()
     if currency == "USD":
@@ -95,11 +95,11 @@ def get_fx_rate_to_usd(currency: str) -> float:
     return _fx_cache.get(currency, 1.0)
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def get_usd_to_currency_rate(target: str) -> float:
     """
     Return real-time rate: how many units of `target` = 1 USD.
-    e.g. INR -> ~84,  CAD -> ~1.36,  USD -> 1.0
-    Uses Yahoo Finance forex tickers (USD{TARGET}=X).
+    Cached for 30 minutes.
     """
     target = target.upper()
     if target == "USD":
@@ -149,7 +149,7 @@ def fetch_symbol_info(symbol: str) -> dict:
 
 
 def refresh_all_prices():
-    """Fetch today's price for every asset and store in asset_prices."""
+    """Fetch today's price for every asset and store in asset_prices. Clears portfolio cache."""
     assets = db.get_all_assets()
     today = str(date.today())
     results = []
@@ -158,6 +158,8 @@ def refresh_all_prices():
         if price is not None:
             db.upsert_price(asset["id"], today, price)
             results.append((asset["symbol"], price))
+    # Invalidate cached portfolio so next read reflects fresh prices
+    get_portfolio_summary.clear()
     return results
 
 
@@ -233,19 +235,14 @@ def get_commodity_price_per_unit(symbol: str, unit: str) -> float | None:
     return price_per_trading_unit   # troy oz, barrel, etc.
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_portfolio_summary():
     """
     Returns (rows, total_invested_usd, total_current_usd, fx_rates).
 
-    Each row has both native-currency values and USD-converted equivalents:
-      current_value      — in asset's native currency
-      current_value_usd  — converted to USD at real-time rate
-      invested_value     — in asset's native currency
-      invested_value_usd — converted to USD at real-time rate
-      gain_loss / gain_loss_pct — computed in native currency
-
-    Totals (total_invested_usd, total_current_usd) are always in USD.
-    fx_rates — dict of {currency: rate_to_usd} used this run.
+    Each row has both native-currency values and USD-converted equivalents.
+    Cached for 60 seconds — call once and share across tabs.
+    Uses a single batched DB query for all latest prices (O(1) instead of O(N)).
     """
     assets = db.get_all_assets()
     rows = []
@@ -253,13 +250,17 @@ def get_portfolio_summary():
     total_current_usd = 0.0
     fx_rates: dict[str, float] = {}
 
+    # Single DB round-trip for all latest prices
+    asset_ids = [a["id"] for a in assets]
+    latest_prices = db.get_latest_prices_batch(asset_ids)
+
     for a in assets:
         currency = a["currency"]
         if currency not in fx_rates:
             fx_rates[currency] = get_fx_rate_to_usd(currency)
         rate = fx_rates[currency]
 
-        latest = db.get_latest_price(a["id"])
+        latest = latest_prices.get(a["id"])
         raw_price = latest["price"] if latest else None
 
         # Commodities stored in grams need price conversion
